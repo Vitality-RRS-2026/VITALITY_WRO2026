@@ -39,7 +39,6 @@ series of genuinely difficult electrical and mechanical failures — all of whic
 are documented honestly below, because that is where most of the engineering
 actually happened.
 
-*Last updated: [DATE]*
 
 ---
 
