@@ -5,10 +5,10 @@
 <h1 align="center">⚡ WRO 2026 Future Engineers — Team Vitality</h1>
 
 <p align="center">
-  <a href="[INSTAGRAM URL]">
+  <a href="https://www.instagram.com/vitality2026.wro?stkn=dWI4NWJjdDJrMzQw">
     <img src="https://img.shields.io/badge/Instagram-%23E4405F.svg?style=for-the-badge&logo=Instagram&logoColor=white" alt="Instagram">
   </a>
-  <a href="[YOUTUBE URL]">
+  <a href="https://youtu.be/qGNv-WUXziQ">
     <img src="https://img.shields.io/badge/YouTube-%23FF0000.svg?style=for-the-badge&logo=YouTube&logoColor=white" alt="YouTube">
   </a>
 </p>
