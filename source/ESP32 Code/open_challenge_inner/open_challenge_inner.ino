@@ -1,0 +1,732 @@
+/* ============================================================================
+   WRO Future Engineers - OPEN CHALLENGE
+   3 laps, then stop in the starting section.
+   ----------------------------------------------------------------------------
+   HOW IT WORKS
+     Straight : PD wall-follow, centred between the two side walls
+     Corner   : a side sensor reads long -> turn 90 deg USING THE GYRO
+     Counting : 12 corners = 3 laps
+     Finish   : after corner 12, keep following the wall for FINISH_MS, stop
+
+   WHY THE GYRO RUNS THE TURN, NOT A TIMER
+     A timed turn changes with battery voltage and floor grip, so it drifts
+     over 12 corners. "Turn until the gyro says 90" is the same every time.
+     After each corner the heading is SNAPPED to the nearest multiple of 90,
+     which stops drift accumulating across the run.
+
+   SET TUNING_MODE 1 FIRST. The motor stays off and sensors print.
+   ============================================================================ */
+
+#include <Wire.h>
+#include <ESP32Servo.h>
+
+#define TUNING_MODE 0        // 1 = print only, no driving. 0 = run.
+
+/* --- pins --------------------------------------------------------------- */
+const int PIN_PWMA   = 25;
+const int PIN_AIN1   = 26;
+const int PIN_AIN2   = 27;
+const int PIN_SERVO  = 14;
+const int PIN_TRIG_L = 32;
+const int PIN_ECHO_L = 34;
+const int PIN_TRIG_R = 33;
+const int PIN_ECHO_R = 35;
+
+// Start button: one leg to GPIO 23, the other to GND.
+// INPUT_PULLUP means the pin reads HIGH when released, LOW when pressed,
+// so no external resistor is needed.
+const int PIN_START_BUTTON = 23;
+
+/* --- tuning ------------------------------------------------------------- */
+const int   SERVO_CENTER = 90;     // YOUR measured straight-ahead value
+
+// Set to 1 if the robot steers the WRONG WAY.
+// Depending on how the linkage is assembled and which way the servo horn
+// was pressed on, increasing the servo angle may turn the wheels left on
+// one build and right on another. This flips it in software instead of
+// making you rebuild the linkage.
+#define STEER_INVERT 1
+
+// Set to 1 if yaw counts the WRONG WAY.
+// The turn logic assumes yaw INCREASES when the robot turns right. Whether
+// that is true depends on which way up the MPU6050 is mounted. If it is
+// inverted, a right turn drives yaw away from its target and the robot
+// turns forever.
+//
+// HOW TO CHECK: run with TUNING_MODE 1, rotate the robot clockwise by hand
+// (viewed from above) and watch yaw in the telemetry. It must go UP.
+#define GYRO_INVERT 1
+// SERVO STALL WARNING. Two servos were destroyed at 60 degrees by
+// stalling against the linkage's mechanical stop - the servo pushes at
+// near stall current until the windings overheat, which takes several
+// runs to kill it, so it looks fine until suddenly it is not.
+//
+// Currently set to 50. Verify with servo_sweep.ino that the linkage does
+// not bind before this angle, and check the servo by hand after each run:
+// warm is normal, too hot to hold comfortably means it is stalling.
+const int   STEER_MAX    = 50;     // max deviation either side
+const int   STEER_LOCK   = 50;     // deviation used during a corner
+
+const int   SPEED_STRAIGHT = 125;
+const int   SPEED_TURN     = 100;   // must be above your motor deadband
+
+// Wall following
+const float KP_WALL = 0.55f;
+const float KD_WALL = 0.25f;
+const float TARGET_SIDE_CM = 50.0f;   // used before the direction is known
+
+/* --- inner wall following ------------------------------------------------
+   Once the first corner tells us the direction, we stop centring between
+   the walls and hold a fixed distance from the INNER wall instead.
+
+   WHY THIS DISTANCE: on a rectangular track an arc of radius R centred on
+   the inner corner vertex is tangent to both walls at distance R. Holding
+   R from the inner wall along the straight means the robot can turn at its
+   natural radius and come out parallel to the next wall at the same
+   distance, with no correction needed afterwards.
+
+   Set it to your MEASURED turning radius (square_test.ino reports it from
+   encoder arc length and gyro angle). Estimate at STEER_LOCK 50: ~24 cm.
+   ------------------------------------------------------------------------ */
+const float INNER_FOLLOW_CM = 24.0f;
+
+/* --- turn abort ----------------------------------------------------------
+   A turn is abandoned if the robot closes on the inner wall, or swings so
+   wide the outer wall is nearly out of reach. Either means the turn is
+   going wrong and continuing it ends in a wall. Break off, steer clear,
+   and let the corner be detected again from a better position.
+   ------------------------------------------------------------------------ */
+const float ABORT_INNER_CM  = 10.0f;   // too close to the inside
+const float ABORT_OUTER_CM  = 85.0f;   // swung too far out
+const int   ESCAPE_STEER    = 20;      // degrees away from the inner wall
+const unsigned long ESCAPE_MS = 400;   // how long to hold the escape
+
+
+
+// Corner detection
+const float CORNER_DIST_CM   = 120.0f;  // side reading above this = no wall
+const int   CORNER_CONFIRM   = 3;       // consecutive readings needed (2 = ~80ms delay)
+
+/* A reading of 200 can mean two very different things:
+     - genuinely nothing there              (a real corner)
+     - the pulse hit a wall at a steep angle and reflected away
+   The second is what makes a crooked robot turn into a wall.
+
+   A real long reading (say 140 cm, a proper echo from across the track)
+   is trustworthy after CORNER_CONFIRM. A no-echo needs this many instead,
+   because it has to persist to be believed. At ~40ms per sensor refresh,
+   7 confirmations is about 280ms - long enough that a momentary bad angle
+   passes, short enough not to miss a corner.                            */
+const int   NOECHO_CONFIRM   = 6;
+
+const float TURN_ANGLE       = 90.0f;
+
+/* A turn may finish once yaw is within this many degrees of the target.
+
+   At 30 this is a LARGE tolerance: a 90 degree turn can end after only 60
+   degrees of sweep. That is deliberate - it stops the robot over-rotating
+   - but it means each corner may leave the robot up to 30 degrees short.
+
+   Two things keep that from compounding:
+     - the both-walls check below usually ends the turn on real alignment
+       rather than on this tolerance
+     - the next corner targets an ABSOLUTE heading, so a short turn is
+       corrected by the following one rather than accumulating           */
+const float TURN_TOLERANCE_DEG = 30.0f;
+
+/* Seeing a wall on BOTH sides again means the robot is back in a corridor,
+   i.e. the turn is done - regardless of what the gyro thinks. This is an
+   independent confirmation that does not accumulate drift. It is only
+   trusted once the robot has already swept most of the turn, so that the
+   corridor it came FROM cannot end the turn immediately. */
+const float BOTH_WALLS_MIN_SWEEP = 65.0f;
+
+// Consecutive confirmations before trusting the both-walls reading.
+const int   CORRIDOR_CONFIRM  = 3;
+
+/* Acceptable range for a commanded turn. Every corner on this track is 90
+   degrees; the self-correcting heading target may legitimately ask for a
+   bit more or less to straighten the robot up, but never double. Outside
+   this band the rounding has gone wrong and we fall back to a plain 90. */
+const float TURN_SWEEP_MIN   = 40.0f;
+const float TURN_SWEEP_MAX   = 140.0f;
+const unsigned long MIN_CORNER_GAP_MS = 1200;
+
+// Gyro bias samples, 2ms each. Runs after the button, so it costs run time.
+const int   GYRO_CAL_SAMPLES = 800;   // 1.6 s
+
+// A 90 degree turn should take well under this. Exceeding it means
+// something is wrong, so the robot stops instead of circling.
+const unsigned long TURN_TIMEOUT_MS = 4000;
+
+
+
+// Run length
+const int   TOTAL_CORNERS = 12;         // 4 per lap x 3 laps
+const unsigned long FINISH_MS = 500;   // TUNE: drive time after last corner
+
+const float US_MAX_CM = 200.0f;
+const unsigned long US_TIMEOUT_US = 12000;
+const int MPU_ADDR = 0x68;
+
+/* --- globals ------------------------------------------------------------ */
+Servo steer;
+float distL = US_MAX_CM, distR = US_MAX_CM;
+float yaw = 0, gyroBias = 0, headingTarget = 0;
+float prevError = 0;
+int   cornerCount = 0;
+int   longL = 0, longR = 0;
+bool  noEchoL = false, noEchoR = false;
+int   corridorCount = 0;
+int   usTurn = 0;
+int   turnDir = 0;                 // +1 right, -1 left. Set at first corner.
+unsigned long lastLoop = 0, finishStart = 0, turnStartMs = 0;
+unsigned long lastYawUs = 0;
+float turnStartYaw = 0;
+unsigned long lastCornerMs = 0;
+unsigned long escapeStart = 0;
+
+enum State { WAIT, DRIVE, TURNING, ESCAPE, FINISHING, DONE };
+State state = WAIT;
+
+/* --- MPU6050 ------------------------------------------------------------ */
+void mpuInit() {
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x6B); Wire.write(0x00); Wire.endTransmission();
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x1B); Wire.write(0x00); Wire.endTransmission();
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x1A); Wire.write(0x03); Wire.endTransmission();
+}
+/* Reads the gyro's Z rate. Tracks consecutive failures so the rest of the
+   program can fall back to timed turns instead of stalling forever. */
+float gyroRaw() {
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x47);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 2, true);
+  if (Wire.available() < 2) return 0;
+  int16_t v = (Wire.read() << 8) | Wire.read();
+  return (float)v;
+}
+/* Measures the gyro's resting offset so it can be subtracted from every
+   later reading.
+
+   TIMING NOTE: this now runs AFTER the start button, so it is inside the
+   scored run. At 2ms per sample, GYRO_CAL_SAMPLES directly sets how much
+   dead time you spend before moving:
+
+       400 samples  = 0.8 s   noisier bias, more heading drift per lap
+       800 samples  = 1.6 s   good compromise (default)
+      1500 samples  = 3.0 s   best bias, 3 s of your round gone
+
+   The round is 3 minutes, so this is not critical, but it is free lap time
+   if your gyro is well behaved. Check the printed bias across several runs:
+   if it varies by more than about 5 counts, raise the sample count. */
+void calibrateGyro() {
+  Serial.println(F("gyro cal - HOLD STILL"));
+  double s = 0;
+  for (int i = 0; i < GYRO_CAL_SAMPLES; i++) { s += gyroRaw(); delay(2); }
+  gyroBias = s / (double)GYRO_CAL_SAMPLES;
+  Serial.print(F("bias ")); Serial.println(gyroBias, 1);
+}
+void updateYaw(float dt) {
+  float r = (gyroRaw() - gyroBias) / 131.0f;
+  if (fabs(r) < 0.6f) r = 0;
+#if GYRO_INVERT
+  r = -r;
+#endif
+  yaw += r * dt;
+}
+
+/* --- ultrasonic --------------------------------------------------------- */
+/* Set true when the last ping TIMED OUT rather than returning a real
+   echo. A timeout is ambiguous - it can mean "no wall" or "the pulse hit
+   the wall at an angle and reflected away" - so the caller treats it with
+   more suspicion than a genuine long reading. */
+bool lastPingTimedOut = false;
+
+float ping(int trig, int echo) {
+  digitalWrite(trig, LOW);  delayMicroseconds(3);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  unsigned long us = pulseIn(echo, HIGH, US_TIMEOUT_US);
+
+  /* pulseIn returns 0 when it TIMES OUT - no echo came back within 12ms,
+     which is about 2 metres. That means nothing is in range, i.e. FAR.
+     Being too close does not cause a timeout; it produces a very short
+     pulse and reads as a small number.
+
+     So 0 must map to US_MAX_CM, not to 0. Returning 0 would tell the wall
+     follower a wall is touching the robot, and would stop the
+     distL >= CORNER_DIST_CM test from ever being true, which disables
+     side-based corner detection entirely. */
+  if (us == 0) { lastPingTimedOut = true; return US_MAX_CM; }
+  lastPingTimedOut = false;
+  float cm = us / 58.0f;
+  return (cm > US_MAX_CM) ? US_MAX_CM : cm;
+}
+
+/* One sensor per loop, alternating. Firing both at once means each hears
+   the other's echo. Each sensor refreshes every 2 loops, about 40ms. */
+void updateUltrasonics() {
+  if (usTurn == 0) { distL = ping(PIN_TRIG_L, PIN_ECHO_L); noEchoL = lastPingTimedOut; }
+  else             { distR = ping(PIN_TRIG_R, PIN_ECHO_R); noEchoR = lastPingTimedOut; }
+  usTurn ^= 1;
+}
+
+/* --- actuators ---------------------------------------------------------- */
+void motor(int s) {
+#if TUNING_MODE
+  s = 0;
+#endif
+  s = constrain(s, -255, 255);
+  digitalWrite(PIN_AIN1, s > 0 ? HIGH : LOW);
+  digitalWrite(PIN_AIN2, s < 0 ? HIGH : LOW);
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(PIN_PWMA, abs(s));
+#else
+  ledcWrite(0, abs(s));
+#endif
+}
+void steerTo(float dev) {
+#if STEER_INVERT
+  dev = -dev;
+#endif
+  dev = constrain(dev, -STEER_MAX, STEER_MAX);
+  steer.write(SERVO_CENTER + (int)dev);
+}
+
+/* Which sensor faces the inner wall depends on travel direction.
+   Clockwise (turnDir +1) puts the inner wall on the RIGHT. Meaningless
+   before the direction is known, so callers must check turnDir first. */
+float innerDist() { return (turnDir > 0) ? distR : distL; }
+float outerDist() { return (turnDir > 0) ? distL : distR; }
+
+/* --- wall following ----------------------------------------------------- */
+float wallSteer() {
+  bool seeL = distL < CORNER_DIST_CM;
+  bool seeR = distR < CORNER_DIST_CM;
+  float error;
+
+  if (turnDir == 0) {
+    // Direction unknown - centre between whatever walls are visible
+    if (seeL && seeR)      error = distR - distL;
+    else if (seeL)         error = TARGET_SIDE_CM - distL;
+    else if (seeR)         error = distR - TARGET_SIDE_CM;
+    else                   return 1.2f * (headingTarget - yaw);
+  } else {
+    /* Direction known - hold INNER_FOLLOW_CM from the inner wall.
+
+       Following one wall beats centring: the outer wall is far away so its
+       reading is noisier, and holding the turn radius from the inner wall
+       lines the robot up for the next corner automatically. */
+    float inner = innerDist();
+    if (inner < CORNER_DIST_CM) {
+      // Positive error must mean "steer right".
+      error = (turnDir > 0) ? (inner - INNER_FOLLOW_CM)
+                            : (INNER_FOLLOW_CM - inner);
+    } else if (outerDist() < CORNER_DIST_CM) {
+      float outer = outerDist();       // inner wall lost - fall back
+      error = (turnDir > 0) ? (TARGET_SIDE_CM - outer)
+                            : (outer - TARGET_SIDE_CM);
+    } else {
+      return 1.2f * (headingTarget - yaw);
+    }
+  }
+
+  float d = error - prevError;
+  prevError = error;
+  return KP_WALL * error + KD_WALL * d;
+}
+
+
+/* How far the robot is from its nearest legal heading (a multiple of 90).
+   Every heading on a rectangular track is a multiple of 90, so this is a
+   useful measure of how crooked the robot is running. Telemetry only -
+   it does not gate any decision. */
+float headingError() {
+  return fabs(yaw - round(yaw / 90.0f) * 90.0f);
+}
+
+/* Returns true only on a clean press.
+
+   WHY DEBOUNCE: a mechanical switch bounces for a few milliseconds when
+   pressed, which reads as many separate presses. Requiring the pin to stay
+   LOW for 30ms filters that out. */
+bool startPressed() {
+  static unsigned long downSince = 0;
+  if (digitalRead(PIN_START_BUTTON) == LOW) {
+    if (downSince == 0) downSince = millis();
+    if (millis() - downSince >= 30) return true;
+  } else {
+    downSince = 0;
+  }
+  return false;
+}
+
+/* --- setup ---------------------------------------------------------------
+
+   ORDER MATTERS HERE.
+
+   Only the minimum needed to sit safely still happens before the button:
+   pin directions, actuators parked, I2C awake. Everything that actually
+   prepares the robot to run - gyro calibration above all - happens AFTER
+   the press.
+
+   Why: the gyro bias must be measured while the robot is stationary and in
+   its final position. If we calibrated at power-up, any nudge while placing
+   the robot on the mat would corrupt the bias, and every corner afterwards
+   would inherit that error.
+   -------------------------------------------------------------------------- */
+void setup() {
+  Serial.begin(115200);
+  delay(400);
+
+  /* ---- minimal init: make everything safe and idle ---- */
+
+  // Servo timers FIRST. If the motor PWM claims a timer first, the servo
+  // silently fails to attach and never moves.
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  steer.setPeriodHertz(50);
+  steer.attach(PIN_SERVO, 500, 2400);
+  steerTo(0);
+
+  pinMode(PIN_AIN1, OUTPUT);
+  pinMode(PIN_AIN2, OUTPUT);
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(PIN_PWMA, 20000, 8);
+#else
+  ledcSetup(0, 20000, 8);
+  ledcAttachPin(PIN_PWMA, 0);
+#endif
+  motor(0);                       // motor parked before anything else runs
+
+  pinMode(PIN_TRIG_L, OUTPUT); pinMode(PIN_ECHO_L, INPUT);
+  pinMode(PIN_TRIG_R, OUTPUT); pinMode(PIN_ECHO_R, INPUT);
+  pinMode(PIN_START_BUTTON, INPUT_PULLUP);
+
+  mpuInit();                      // just wakes the chip over I2C, no measuring
+
+  /* ---- WAIT FOR THE BUTTON ---- */
+  // WRO rules: one switch powers the robot on, a SEPARATE button starts the
+  // program. Auto-starting on a timer is a rule violation.
+  Serial.println(F("\nREADY - press start button"));
+  while (!startPressed()) {
+    motor(0);
+    steerTo(0);
+    delay(10);
+  }
+
+  // Wait for release so one long press cannot be read as a second press
+  // later in the run.
+  while (digitalRead(PIN_START_BUTTON) == LOW) delay(10);
+
+  Serial.println(F("GO"));
+
+  /* ---- everything else happens AFTER the press ---- */
+  calibrateGyro();                // robot must be still - it already is
+  yaw = 0;                        // heading zero = straight ahead from here
+  headingTarget = 0;
+  prevError = 0;
+  cornerCount = 0;
+  longL = longR = 0;
+  turnDir = 0;
+
+  lastLoop = millis();
+  lastYawUs = micros();
+
+#if TUNING_MODE
+  Serial.println(F("TUNING MODE - motor disabled"));
+#endif
+  state = DRIVE;
+}
+
+/* --- loop --------------------------------------------------------------- */
+void loop() {
+  /* GYRO FIRST, EVERY ITERATION.
+
+     pulseIn() blocks for up to 12ms when a sensor gets no echo, so the old
+     fixed 20ms loop could stretch to 40ms or more. The gyro was sampled
+     once per loop, which meant integrating at an irregular 25-50Hz and
+     applying each rate reading across the whole gap. That is why turns came
+     out inconsistent - sometimes over, sometimes under.
+
+     Now yaw integrates as fast as the loop can run, using real elapsed
+     micros, and the slow sensor work is throttled separately below.     */
+  unsigned long nowUs = micros();
+  float dt = (nowUs - lastYawUs) / 1000000.0f;
+  lastYawUs = nowUs;
+  if (dt > 0.2f) dt = 0.2f;            // ignore absurd gaps after a stall
+  updateYaw(dt);
+
+  unsigned long now = millis();
+  if (now - lastLoop < 20) return;
+  lastLoop = now;
+
+  /* Ultrasonics are skipped during the FIRST part of a turn: they are not
+     needed there, and pulseIn blocking would thin out the gyro sampling
+     exactly when the turn accuracy depends on it.
+
+     Once the robot has swept past BOTH_WALLS_MIN_SWEEP they come back on, so
+     the early-exit check below has data to work with. */
+  /* Sensors run CONTINUOUSLY, including during turns - they are needed
+     mid-turn to abort if the robot closes on the inner wall or swings too
+     wide. Yaw integrates every loop iteration above, before this throttled
+     section, so the blocking pulseIn calls do not starve it. */
+  updateUltrasonics();
+
+  // Debounced "wall has gone" detection
+  if (distL >= CORNER_DIST_CM) longL++; else longL = 0;
+  if (distR >= CORNER_DIST_CM) longR++; else longR = 0;
+
+  /* A no-echo reading has to persist longer before it is believed.
+
+     A reading of 200 means either "genuinely nothing there" (a real
+     corner) or "the pulse hit a wall at a steep angle and reflected
+     away". The second is what makes a crooked robot turn into a wall, so
+     a timeout needs NOECHO_CONFIRM readings while a real long echo - a
+     proper reflection from across the track - needs only CORNER_CONFIRM. */
+  int needL = noEchoL ? NOECHO_CONFIRM : CORNER_CONFIRM;
+  int needR = noEchoR ? NOECHO_CONFIRM : CORNER_CONFIRM;
+
+  switch (state) {
+
+    case WAIT:                  // safe idle - not used in normal flow,
+      motor(0);                 // the button wait now happens in setup()
+      steerTo(0);
+      break;
+
+    case DRIVE: {
+      steerTo(wallSteer());
+      motor(SPEED_STRAIGHT);
+
+      /* CORNER DETECTION: a side wall disappearing.
+
+         The exclusivity check - one side long while the other is NOT -
+         stops an open area on both sides from triggering a random turn. */
+      bool cornerL = (longL >= needL) && (longR < needR);
+      bool cornerR = (longR >= needR) && (longL < needL);
+
+      // Corners are physically far apart, so a detection too soon after
+      // the last one is spurious. This guard does not depend on any sensor
+      // being accurate, unlike a heading-based check.
+      bool spacedOut = (millis() - lastCornerMs) > MIN_CORNER_GAP_MS;
+
+      if ((cornerL || cornerR) && spacedOut) {
+        // Lap direction is decided by the FIRST corner, because the start
+        // direction is randomised. Do not assume clockwise.
+        if (turnDir == 0) {
+          turnDir = cornerL ? -1 : +1;
+          Serial.print(F("direction: "));
+          Serial.println(turnDir > 0 ? F("clockwise") : F("anticlockwise"));
+        }
+        // ABSOLUTE heading target, not a relative sweep.
+        //
+        // The track is a rectangle, so every legal heading is a multiple
+        // of 90 degrees. round(yaw/90)*90 gives the heading we SHOULD have
+        // been on; adding 90 in the turn direction gives the heading we
+        // should end up on.
+        //
+        // This self-corrects. Entering a corner 30 degrees crooked means
+        // the robot turns 60 or 120 degrees as needed to come out straight,
+        // instead of turning a blind 90 and staying 30 degrees off.
+        /* Absolute heading target, with a sanity clamp.
+
+           round(yaw/90) self-corrects small heading errors, which is what
+           we want. But it has a cliff: once the robot is more than 45
+           degrees off, round() snaps to the WRONG multiple of 90 and the
+           commanded turn jumps by a full 90 degrees. Measured: at yaw -134
+           the sweep is 46 degrees; at -136 it becomes 136 degrees.
+
+           So compute the target, then check how far it actually asks the
+           robot to turn. A corner on this track is 90 degrees. Anything
+           outside a sensible band means the rounding went over the cliff,
+           and we fall back to a plain 90 from the current heading.       */
+        headingTarget = round(yaw / 90.0f) * 90.0f + turnDir * TURN_ANGLE;
+
+        float sweep = fabs(headingTarget - yaw);
+        if (sweep < TURN_SWEEP_MIN || sweep > TURN_SWEEP_MAX) {
+          Serial.print(F("  sweep ")); Serial.print(sweep, 0);
+          Serial.println(F(" deg out of range - using plain 90"));
+          headingTarget = yaw + turnDir * TURN_ANGLE;
+        }
+        turnStartMs = millis();
+        turnStartYaw = yaw;
+        corridorCount = 0;
+        lastCornerMs = millis();
+        state = TURNING;
+        Serial.print(F("corner ")); Serial.println(cornerCount + 1);
+      }
+      break;
+    }
+
+    case TURNING: {
+      steerTo(turnDir * STEER_LOCK);
+      motor(SPEED_TURN);
+
+      float swept = fabs(yaw - turnStartYaw);
+
+      /* Two independent ways to finish a turn.
+
+         1. GYRO - yaw within TURN_TOLERANCE_DEG of the target, or past it.
+            Tolerance matters because tyre scrub or a brush against a wall
+            can eat the last few degrees; without it the turn hangs until
+            the timeout and the corner never gets counted.
+
+         2. BOTH WALLS - a wall visible on both sides means the robot is
+            back in a corridor and pointing down it. That is physical
+            evidence of alignment, so it ends the turn whatever the gyro
+            says. Valuable precisely because it does NOT drift: if the gyro
+            is slowly accumulating error, the walls still tell the truth.
+
+            Only trusted after BOTH_WALLS_MIN_SWEEP degrees, otherwise the
+            corridor the robot came FROM would end the turn immediately.
+            Confirmed over several readings, since ultrasonics mis-read.
+
+            When the walls end the turn, yaw is set to the target - the
+            walls say we ARE aligned, so this is an evidence-based
+            correction rather than a blind snap.                          */
+      bool byGyro = fabs(yaw - headingTarget) <= TURN_TOLERANCE_DEG;
+      if (turnDir > 0 && yaw >= headingTarget) byGyro = true;
+      if (turnDir < 0 && yaw <= headingTarget) byGyro = true;
+
+      bool byWalls = false;
+      if (!byGyro && swept >= BOTH_WALLS_MIN_SWEEP) {
+        /* The OUTER sensor verifies completion. Coming out of a corner it
+           is the wall that returns to a sensible distance; the inner wall
+           is close and its reading is dominated by the corner itself. */
+        if (outerDist() < CORNER_DIST_CM) corridorCount++;
+        else                              corridorCount = 0;
+
+        if (corridorCount >= CORRIDOR_CONFIRM) {
+          Serial.print(F("  corridor found at yaw ")); Serial.print(yaw, 0);
+          Serial.print(F(" (target ")); Serial.print(headingTarget, 0);
+          Serial.print(F("), swept ")); Serial.print(swept, 0);
+          Serial.println(F(" deg - ending turn"));
+          yaw = headingTarget;
+          byWalls = true;
+        }
+      }
+
+      bool reached = byGyro || byWalls;
+
+      /* ABORT: inner distance below ABORT_INNER_CM means the robot is
+         about to clip the inside of the corner; outer above
+         ABORT_OUTER_CM means it has swung too wide. Either way the turn
+         is failing, so break off rather than drive into a wall. */
+      if (!reached && turnDir != 0) {
+        float inner = innerDist();
+        float outer = outerDist();
+        if (inner < ABORT_INNER_CM || outer > ABORT_OUTER_CM) {
+          Serial.print(F("  !! TURN ABORT inner=")); Serial.print(inner, 0);
+          Serial.print(F(" outer=")); Serial.println(outer, 0);
+          escapeStart = millis();
+          state = ESCAPE;
+          break;
+        }
+      }
+
+      // SAFETY: a turn should never take more than a few seconds. If it
+      // does, the gyro sign is likely wrong - see GYRO_INVERT.
+      if (!reached && millis() - turnStartMs > TURN_TIMEOUT_MS) {
+        motor(0);
+        steerTo(0);
+        Serial.println(F("!! TURN TIMEOUT - check GYRO_INVERT"));
+        Serial.print(F("   yaw=")); Serial.print(yaw, 1);
+        Serial.print(F(" target=")); Serial.println(headingTarget, 1);
+        state = DONE;
+        break;
+      }
+
+      if (reached) {
+        // NOTE: we deliberately do NOT snap yaw to a multiple of 90 here.
+        // Snapping made the numbers look clean while leaving the robot
+        // physically crooked, and the error compounded corner after corner.
+        // Because the next turn targets an absolute heading, any residual
+        // error is corrected by the turn itself.
+        headingTarget = round(yaw / 90.0f) * 90.0f;
+        lastCornerMs = millis();      // gap measured from turn EXIT
+        prevError = 0;
+        longL = longR = 0;
+        corridorCount = 0;
+
+        /* INVALIDATE STALE DISTANCES.
+
+           Ultrasonics are skipped during most of a turn, so these values
+           can still describe the corner the robot just came out of. Acting
+           on them in DRIVE made the robot clamp its steering as if a wall
+           were still close ahead, so it could not correct its line and
+           drove into the wall.
+
+           Setting them to maximum means "unknown, assume clear" until a
+           real reading arrives, which takes about 60ms. */
+        distL = distR = US_MAX_CM;
+        cornerCount++;
+
+        if (cornerCount >= TOTAL_CORNERS) {
+          finishStart = millis();
+          state = FINISHING;
+          Serial.println(F("3 laps done - heading to start section"));
+        } else {
+          state = DRIVE;
+        }
+      }
+      break;
+    }
+
+    /* ESCAPE: steer away from the inner wall briefly after an aborted
+       turn, then resume. The corner counter is NOT incremented - the
+       corner was not completed, so it gets detected again once clear. */
+    case ESCAPE: {
+      int away = (turnDir > 0) ? -ESCAPE_STEER : ESCAPE_STEER;
+      steerTo(away);
+      motor(SPEED_TURN);
+      if (millis() - escapeStart >= ESCAPE_MS) {
+        prevError = 0;
+        longL = longR = 0;
+        corridorCount = 0;
+        lastCornerMs = millis();
+        state = DRIVE;
+        Serial.println(F("  escape done, resuming"));
+      }
+      break;
+    }
+
+    case FINISHING:
+      steerTo(wallSteer());
+      motor(SPEED_STRAIGHT);
+      if (millis() - finishStart >= FINISH_MS) {
+        motor(0); steerTo(0);
+        state = DONE;
+        Serial.println(F("STOPPED"));
+      }
+      break;
+
+    case DONE:
+      motor(0);
+      steerTo(0);
+      break;
+
+    default:
+      motor(0);
+      break;
+  }
+
+  static uint8_t n = 0;
+  if (++n >= 5) {
+    n = 0;
+    Serial.print(F("L=")); Serial.print(distL, 0);
+    if (noEchoL) Serial.print(F("*"));
+    Serial.print(F(" R=")); Serial.print(distR, 0);
+    if (noEchoR) Serial.print(F("*"));
+    Serial.print(F(" yaw=")); Serial.print(yaw, 0);
+    Serial.print(F(" err=")); Serial.print(headingError(), 0);
+    if (turnDir != 0) {
+      Serial.print(F(" in=")); Serial.print(innerDist(), 0);
+      Serial.print(F(" out=")); Serial.print(outerDist(), 0);
+    }
+    Serial.print(F(" corners=")); Serial.print(cornerCount);
+    Serial.print(F(" state=")); Serial.println((int)state);
+  }
+}
