@@ -39,6 +39,7 @@ series of genuinely difficult electrical and mechanical failures — all of whic
 are documented honestly below, because that is where most of the engineering
 actually happened.
 
+*Last updated: [DATE]*
 
 ---
 
@@ -387,15 +388,15 @@ causes crosstalk — each hears the other's echo. Their ECHO pins connect throug
 | Component | Image | Qty | Function | Key specifications |
 |---|---|---|---|---|
 | **ESP32-WROOM-32** | <img src="Images/esp32.jpg" width="120"> | 1 | Main controller | Dual-core 240 MHz, 3.3 V logic, runs all control and sensing |
-| **OpenMV Cam H7+** | <img src="Images/openmv_cam_h7_.jpg" width="120"> | 1 | Vision processing | STM32H7, QVGA capture, on-board LAB blob detection |
+| **OpenMV Cam H7+** | <img src="Images/openmv_cam_h7+.jpg" width="120"> | 1 | Vision processing | STM32H7, QVGA capture, on-board LAB blob detection |
 | **GA25-370 geared motor** | <img src="Images/GA25-370_motor_with_encoder.jpg" width="120"> | 1 | Rear-wheel drive | 12 V DC, integrated quadrature encoder (6 wires) |
 | **TB6612FNG driver** | <img src="Images/tb6612fng_motor_driver.jpg" width="120"> | 1 | Motor control | Dual H-bridge, VM to 13.5 V, 3.3 V logic |
 | **MG90S servo** | <img src="Images/MG90S_servo_motor.jpg" width="120"> | 1 | Steering actuation | 2.2 kg·cm at 6 V, metal gears, 13.4 g |
 | **MPU6050 IMU** | <img src="Images/mpu6050.jpg" width="120"> | 1 | Heading measurement | 6-axis, I²C, gyro Z used for yaw integration |
 | **LM2596 buck converter** | <img src="Images/LM2596_buck_converter.jpg" width="120"> | 1 | 12.6 V → 5 V | 4–35 V in, adjustable out, ~92% efficiency |
-| **HC-SR04 ultrasonic** | *[photo to add]* | 2 | Wall distance | 5 V, 2–400 cm, ECHO through 1k/2k divider |
-| **3S Li-ion pack** | *[photo to add]* | 1 | Power source | 11.1 V nominal, 12.6 V full |
-| **Push button** | *[photo to add]* | 1 | Start trigger | GPIO 23 to GND, `INPUT_PULLUP` |
+| **HC-SR04 ultrasonic** | <img src="Images/ultrasonic.jpg" width="120"> | 2 | Wall distance | 5 V, 2–400 cm, ECHO through 1k/2k divider |
+| **3S Li-ion pack** | <img src="Images/battery.jpg" width="120"> | 1 | Power source | 11.1 V nominal, 12.6 V full |
+| **Push button** | <img src="Images/button.jpg" width="120"> | 1 | Start trigger | GPIO 23 to GND, `INPUT_PULLUP` |
 
 **Component selection philosophy:** we deliberately chose widely available,
 well-documented parts so another team can source and reproduce this build. Every
