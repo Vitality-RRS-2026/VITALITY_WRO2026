@@ -23,13 +23,13 @@ category.
 
 | Member | Age | Year |
 |---|---|---|
-| **Ronak Agarwal** | 17 | Senior year of high school |
-| **Saurabh Rawat** | 17 | Senior year of high school |
-| **Raghav Mathur** | 17 | Senior year of high school |
+| **Ronak Agarwal** | 17 | Final year of high school |
+| **Saurabh Rawat** | 17 | Final year of high school |
+| **Raghav Mathur** | 17 | Final year of high school |
 
 <!-- TEAM PHOTO — replace when uploaded -->
 <p align="center">
-  <em>Team photo coming soon — <code>Images/team_photo.jpg</code></em>
+  <img src="Images/Team.jpeg" alt="Team Photo" width="240">
 </p>
 
 This is our first year in the Future Engineers category. We designed our own
