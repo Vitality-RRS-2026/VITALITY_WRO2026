@@ -23,9 +23,9 @@ category.
 
 | Member | Age | Year |
 |---|---|---|
-| **Ronak Agarwal** | 17 | Final year of high school |
-| **Saurabh Rawat** | 17 | Final year of high school |
-| **Raghav Mathur** | 17 | Final year of high school |
+| **Ronak Agarwal** | 17 | Senior year of high school |
+| **Saurabh Rawat** | 17 | Senior year of high school |
+| **Raghav Mathur** | 17 | Senior year of high school |
 
 <!-- TEAM PHOTO — replace when uploaded -->
 <p align="center">
